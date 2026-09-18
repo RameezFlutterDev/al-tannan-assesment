@@ -1,0 +1,173 @@
+rules_version = '2';
+
+// Al Tannan attendance system — this file IS the backend for this project.
+// There is no application server: both apps talk to Firestore directly,
+// and these rules are the only server-side gate. See README.md's
+// "Security Model" and "Known Limitations" for the full write-up.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function employeeDoc(uid) {
+      return get(/databases/$(database)/documents/employees/$(uid)).data;
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/employees/$(request.auth.uid)) &&
+        employeeDoc(request.auth.uid).role == 'admin';
+    }
+
+    function isOwner(employeeId) {
+      return signedIn() && request.auth.uid == employeeId;
+    }
+
+    // Equirectangular-approximation distance check — accurate at geofence
+    // scale (tens-hundreds of meters). Rules have no trig functions, so
+    // `cosLatitude` is precomputed client-side and stored on the location
+    // doc (see WorkLocation.cosLatitude). Comparing squared distances
+    // avoids needing `sqrt` too.
+    function withinGeofence(lat, lng, loc) {
+      let dx = (lng - loc.longitude) * loc.cosLatitude * 111320.0;
+      let dy = (lat - loc.latitude) * 110540.0;
+      return (dx * dx + dy * dy) <= (loc.radiusMeters * loc.radiusMeters);
+    }
+
+    function isValidStateChange(oldState, newState) {
+      return
+        (oldState == 'not_started' && newState == 'checked_in') ||
+        (oldState == 'checked_in' && (newState == 'on_break' || newState == 'completed')) ||
+        (oldState == 'on_break' && newState == 'checked_in');
+    }
+
+    // The one shared "hard gate" every accepted attendance write goes
+    // through, whatever action it represents: not a mocked GPS signal,
+    // matches the caller's *currently* assigned shift/location (never
+    // trust a client-submitted assignment), and inside that location's
+    // geofence. Takes explicit fields rather than a `data` doc because
+    // attendanceEvents stores them as latitude/longitude/isMockedClientFlag
+    // while attendanceDays stores the same values as
+    // lastActionLatitude/lastActionLongitude/lastActionIsMockedClientFlag.
+    function passesLocationIntegrity(lat, lng, isMocked, assignedShiftId, assignedLocationId) {
+      let emp = employeeDoc(request.auth.uid);
+      let loc = get(/databases/$(database)/documents/locations/$(emp.currentLocationId)).data;
+      let shift = get(/databases/$(database)/documents/shifts/$(emp.currentShiftId)).data;
+      return isMocked == false &&
+        assignedShiftId == emp.currentShiftId &&
+        assignedLocationId == emp.currentLocationId &&
+        // A location/shift an admin has deactivated can no longer be
+        // checked into, even for an employee still assigned to it —
+        // closes the loop with the admin panel hiding inactive ones
+        // from new assignments.
+        loc.isActive == true &&
+        shift.isActive == true &&
+        withinGeofence(lat, lng, loc);
+    }
+
+    // ---------- employees ----------
+    // employeeId (doc id) == Firebase Auth uid by convention.
+
+    match /employees/{employeeId} {
+      allow read: if isOwner(employeeId) || isAdmin();
+      // Only admins write — an employee editing their own doc could grant
+      // themselves admin or move their own geofence/shift assignment.
+      allow write: if isAdmin();
+    }
+
+    // ---------- shifts / locations ----------
+
+    match /shifts/{shiftId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /locations/{locationId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------- assignments ----------
+    // History/audit trail of shift+location reassignments (the optional
+    // date-based-scheduling bonus). NOT what attendance actions are
+    // checked against — that uses employees/{uid}.currentShiftId /
+    // currentLocationId so every check above is a single get(), never a
+    // date-range query (rules can't run those at all).
+
+    match /assignments/{assignmentId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------- attendanceEvents ----------
+    // Immutable per-action audit log — every attempt, accepted or
+    // rejected — written by the owning employee's own client.
+
+    match /attendanceEvents/{eventId} {
+      allow read: if isAdmin() || isOwner(resource.data.employeeId);
+      allow update, delete: if false;
+
+      allow create: if signedIn() &&
+        request.resource.data.employeeId == request.auth.uid &&
+        request.resource.data.actionType in
+          ['check_in', 'break_out', 'break_in', 'check_out'] &&
+        (
+          // Rejected attempts are self-reported by the device — there's
+          // no server to verify a rejection, so this branch only checks
+          // ownership/shape. See README.md "Known Limitations".
+          request.resource.data.accepted == false ||
+          (request.resource.data.accepted == true &&
+            passesLocationIntegrity(
+              request.resource.data.latitude,
+              request.resource.data.longitude,
+              request.resource.data.isMockedClientFlag,
+              request.resource.data.assignedShiftId,
+              request.resource.data.assignedLocationId))
+        );
+    }
+
+    // ---------- attendanceDays ----------
+    // One doc per employee per date, id = '{employeeId}_{yyyy-MM-dd}'.
+    // The aggregate the employee home screen and admin reports read from.
+
+    match /attendanceDays/{dayId} {
+      // resource is null when the doc doesn't exist yet (before the
+      // employee's first check-in today) — dereferencing resource.data in
+      // that case throws and evaluates as deny, so that branch is checked
+      // against dayId's embedded employeeId instead.
+      allow read: if isAdmin() ||
+        (resource == null && signedIn() && dayId.split('_')[0] == request.auth.uid) ||
+        (resource != null && isOwner(resource.data.employeeId));
+      allow delete: if false;
+
+      allow create: if signedIn() &&
+        request.resource.data.employeeId == request.auth.uid &&
+        dayId.split('_')[0] == request.auth.uid &&
+        request.resource.data.state == 'checked_in' &&
+        passesLocationIntegrity(
+          request.resource.data.lastActionLatitude,
+          request.resource.data.lastActionLongitude,
+          request.resource.data.lastActionIsMockedClientFlag,
+          request.resource.data.assignedShiftId,
+          request.resource.data.assignedLocationId);
+
+      // Sequence enforcement lives here: the new state must be a legal
+      // transition from the old one, which is what makes duplicate or
+      // out-of-order actions (scenarios #6, #7, #8) fail outright.
+      allow update: if signedIn() &&
+        isOwner(resource.data.employeeId) &&
+        request.resource.data.employeeId == resource.data.employeeId &&
+        isValidStateChange(resource.data.state, request.resource.data.state) &&
+        passesLocationIntegrity(
+          request.resource.data.lastActionLatitude,
+          request.resource.data.lastActionLongitude,
+          request.resource.data.lastActionIsMockedClientFlag,
+          request.resource.data.assignedShiftId,
+          request.resource.data.assignedLocationId);
+    }
+  }
+}

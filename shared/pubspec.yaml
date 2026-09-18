@@ -1,0 +1,23 @@
+name: shared
+description: >
+  Shared domain models, enums, and constants for the Al Tannan Holding
+  attendance system. Used as a local path dependency by both employee_app
+  and admin_panel so the two apps never drift on what an AttendanceStatus,
+  IntegrityResult, or the shape of an AttendanceDay means.
+version: 0.0.1
+publish_to: 'none'
+
+environment:
+  sdk: ^3.10.1
+
+# Deliberately has NO Flutter or Firebase dependency. Firestore's Timestamp
+# type is converted to/from plain DateTime at the boundary inside each app's
+# repository layer (e.g. `Timestamp.fromDate(dateTime)` / `timestamp.toDate()`).
+# That keeps this package a plain, fast-to-test Dart package usable by `dart test`
+# without needing the Flutter SDK.
+dependencies:
+  equatable: ^2.0.5
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0

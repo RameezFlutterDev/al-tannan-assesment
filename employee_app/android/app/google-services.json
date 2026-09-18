@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "953299539232",
+    "project_id": "employee-attendance-altannan",
+    "storage_bucket": "employee-attendance-altannan.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:953299539232:android:4650c613a087bf6396f345",
+        "android_client_info": {
+          "package_name": "com.example.employee_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDIEGOcg75tdFBwzIAYfGhyY8LHD408POo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
